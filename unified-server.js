@@ -28,7 +28,7 @@ class AuthSource {
       );
     } else {
       this.logger.info(
-        '[Auth] 未检测到环境变量的认证信息，将使用 "auth/" 目录下的文件。',
+        '[Auth] 未检测到环境变量认证，将使用 "auth/" 目录下的文件。',
       );
     }
 
@@ -191,6 +191,9 @@ class BrowserManager {
       "--metrics-recording-only",
       "--mute-audio",
       "--safebrowsing-disable-auto-update",
+      "--disable-background-timer-throttling",
+      "--disable-backgrounding-occluded-windows",
+      "--disable-renderer-backgrounding",
     ];
 
     if (this.config.browserExecutablePath) {
@@ -277,6 +280,9 @@ class BrowserManager {
       this.page = await this.context.newPage();
       this.page.on("console", (msg) => {
         const msgText = msg.text();
+        if (msgText.includes("Content-Security-Policy: (Report-Only policy)")) {
+          return;
+        }
         if (msgText.includes("[ProxyClient]")) {
           this.logger.info(
             `[Browser] ${msgText.replace("[ProxyClient] ", "")}`,
@@ -284,6 +290,43 @@ class BrowserManager {
         } else if (msg.type() === "error") {
           this.logger.error(`[Browser Page Error] ${msgText}`);
         }
+      });
+
+      // 增加 1：监听页面崩溃
+      this.page.on("crash", () => {
+        this.logger.error(
+          `🚨 [Browser] 致命：页面进程崩溃 (Crash)！当前账号索引: ${authIndex}`,
+        );
+      });
+
+      // 增加 2：监听意外的页面跳转或刷新
+      this.page.on("framenavigated", (frame) => {
+        // 只关注主框架的跳转
+        if (frame === this.page.mainFrame()) {
+          const newUrl = frame.url();
+          if (
+            newUrl !== "about:blank" &&
+            !newUrl.includes(this.config.targetUrl)
+          ) {
+            this.logger.warn(
+              `⚠️ [Browser] 页面发生了意外导航/刷新！新 URL: ${newUrl}`,
+            );
+          }
+        }
+      });
+
+      // 增加 3：监听 WebSocket 级别的错误 (方便对照)
+      this.page.on("websocket", (ws) => {
+        ws.on("close", () =>
+          this.logger.info(
+            `[Browser Network] 页面内的 WebSocket 连接已关闭: ${ws.url()}`,
+          ),
+        );
+        ws.on("error", (err) =>
+          this.logger.error(
+            `[Browser Network] 页面内的 WebSocket 发生错误: ${err}`,
+          ),
+        );
       });
 
       this.logger.info(`[Browser] 正在导航至目标网页...`);
@@ -877,8 +920,7 @@ class ConnectionRegistry extends EventEmitter {
       this.messageQueues.forEach((queue) => queue.close());
       this.messageQueues.clear();
       this.emit("connectionLost"); // 使用一个新的事件名，表示确认丢失
-    }, 5000); // 5秒的缓冲时间
-    // --- 修改结束 ---
+    }, 10000); // 5秒的缓冲时间
 
     this.emit("connectionRemoved", websocket);
   }
@@ -1211,7 +1253,22 @@ class RequestHandler {
       this.isSystemBusy = true;
       try {
         await this.browserManager.launchOrSwitchContext(this.currentAuthIndex);
-        this.logger.info(`✅ [System] 浏览器已成功恢复！`);
+        this.logger.info(`[System] 浏览器页面已加载，等待 WebSocket 握手...`);
+        let wsReady = false;
+        for (let i = 0; i < 20; i++) {
+          if (this.connectionRegistry.hasActiveConnections()) {
+            wsReady = true;
+            break;
+          }
+          await new Promise((r) => setTimeout(r, 500));
+        }
+
+        if (!wsReady) {
+          throw new Error(
+            "浏览器已启动，但前端 WebSocket 始终未能连接到代理端。",
+          );
+        }
+        this.logger.info(`✅ [System] 浏览器与 WebSocket 已完全恢复就绪！`);
       } catch (error) {
         this.logger.error(`❌ [System] 浏览器自动恢复失败: ${error.message}`);
         return this._sendErrorResponse(
@@ -1220,7 +1277,7 @@ class RequestHandler {
           "服务暂时不可用：后端浏览器实例崩溃且无法自动恢复，请联系管理员。",
         );
       } finally {
-        // --- 恢复结束后，解锁！ ---
+        // 只有确信 WS 连上了，或者彻底失败了，才解锁
         this.isSystemBusy = false;
       }
     }
